@@ -22,12 +22,12 @@
 
 ## 不变量（改动时必须保持）
 
-1. **内部 OpenID 随机生成**：ULID 布局（48 位毫秒时间戳 + 80 位随机，Crockford Base32，26 字符），`lib/openid.ts` 生成。**绝不用自增、绝不用渠道 id**，避免被枚举。
+1. **内部 OpenID 随机生成**：ULID 布局（48 位毫秒时间戳 + 80 位随机，Crockford Base32，26 字符），`lib/openid.ts` 生成；按 [ULID 规范](https://github.com/ulid/spec#overflow-errors-when-parsing-base32-strings) 拒绝大于 `2^48-1` 的时间戳。**绝不用自增、绝不用渠道 id**，避免被枚举。
 2. **`provider_uid` 只能用不可变 id**：GitHub 用 `id`（数字），**不用 `login`，也不用邮箱**——用户名可以改、邮箱可以换。改名不应换身份。
 3. **同一凭据不能挂两次**：由 `UNIQUE(provider, provider_uid)` 在库里强制，冲突时报错而不是静默覆盖。
 4. **禁止只凭邮箱字符串自动合并**：`/user` 的公开邮箱不构成证明，当前一律按**未验证**处理（不写 `canonical_email`）；将来要自动合并，只允许 `email_verified = true` 且该邮箱在全库唯一一致时进行。
 5. **不能把账号锁死**：解绑前必须确认该用户还剩 **≥1** 个可登录身份（`identity-store.countLoginableIdentities`）；`unlink` 由 P1 的接口把关。
-6. **登录成功后轮换 session id**：作废浏览器上原有的那个会话，避免会话固定。
+6. **登录成功后轮换 session id**：作废浏览器上原有的那个会话，避免会话固定。身份创建/更新时间、两种登录审计和会话轮换在同一个数据库事务中提交；任一步失败全部撤销，保留旧会话，且不下发新 sid。GitHub 请求在事务之前完成。
 
 ## 登录流程（本阶段：只有 GitHub）
 
@@ -56,7 +56,7 @@
 ## 存量回填与回滚
 
 - **回填**（`identity-store.backfillSessions()`，服务启动时跑一次）：老库里能定位到的身份只有会话行——`user_id` 是 GitHub 数字 id。为每个不同的 `user_id` 补一份 `users` + `identities`，把已有会话的影子列补上，并各记一条 `identity_audit(action=link, result=backfill)`。过程在一个事务里，最后写 `console_seeds` 标记（`identity_openid`），**重复启动不再执行**。`user_id` 为空的旧会话无法关联身份，只统计不猜（返回值里的 `unlinked`）。
-- **回滚**：`node app/server/scripts/rollback-identity.mjs --db <绝对路径> [--yes]`（默认只报告、不写）。它清空 `sessions.openid/provider`、删掉 `identity_openid` 标记、丢掉三张新表；**不删两个影子列**（SQLite 老版本不支持 `DROP COLUMN`），旧列自始至终没被动过，所以回滚后服务按改造前的逻辑照常跑，下次启动会重新建出三张空表。
+- **回滚**：`node app/server/scripts/rollback-identity.mjs --db <绝对路径> [--yes]`（默认只报告、不写）。它清空 `sessions.openid/provider`、删掉 `identity_openid` 标记、丢掉三张新表；**不删两个影子列**（SQLite 老版本不支持 `DROP COLUMN`），默认以只读连接检查，确认执行时仅清理实际存在的影子列，支持升级中断在两次加列之间的库；旧列与其它播种标记保持原样。操作时先停止使用新身份表的服务，在数据库副本上验证后执行脚本，再启动改造前版本；若再次启动本版本，会重新建表并回填，不会保持回滚状态。
 
 ## 本阶段做了 / 没做
 

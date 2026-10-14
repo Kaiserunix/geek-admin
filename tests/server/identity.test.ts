@@ -65,6 +65,11 @@ describe("内部 OpenID（ULID，随机生成）", () => {
     expect(() => newOpenId(2 ** 50)).toThrow();
     expect(() => newOpenId(0, () => Buffer.alloc(8))).toThrow();
   });
+
+  it("遵守 ULID 的 48 位时间戳上限，不生成超过 128 位的值", () => {
+    expect(newOpenId(2 ** 48 - 1, () => Buffer.alloc(10, 255))).toBe("7ZZZZZZZZZZZZZZZZZZZZZZZZZ");
+    expect(() => newOpenId(2 ** 48)).toThrow();
+  });
 });
 
 describe("身份表结构", () => {
@@ -90,17 +95,20 @@ describe("身份表结构", () => {
 
 describe("GitHub 身份落库", () => {
   it("第一次建身份，第二次只更新 last_login_at", async () => {
-    const { app, close } = await testApp();
+    let now = 1_700_000_000_000;
+    const { app, close } = await testApp({ clock: () => now });
     const { identity } = app.services;
     const first = identity.resolveGithubIdentity({ login: "zhang-san", userId: 4242 });
     expect(first.created).toBe(true);
+    expect(identity.findIdentity(GITHUB_PROVIDER, "4242")?.last_login_at).toBe(now);
+    now += 60_000;
     const second = identity.resolveGithubIdentity({ login: "zhang-san", userId: 4242 });
     expect(second.created).toBe(false);
     expect(second.openid).toBe(first.openid);
     const counts = app.services.storage.db.prepare("SELECT (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM identities) AS identities").get();
     expect(counts).toEqual({ users: 1, identities: 1 });
     expect(identity.listIdentities(first.openid)).toHaveLength(1);
-    expect(identity.findIdentity(GITHUB_PROVIDER, "4242")?.last_login_at).toBeTypeOf("number");
+    expect(identity.findIdentity(GITHUB_PROVIDER, "4242")?.last_login_at).toBe(now);
     await close();
   });
 
@@ -131,6 +139,9 @@ describe("存量回填（老库升级）", () => {
       insert.run("legacy-sid-1", "zhang-san", 4242, null, "x", ts, ts + 60_000);
       insert.run("legacy-sid-2", "li-si", 4243, null, "y", ts, ts + 60_000);
       insert.run("legacy-sid-3", "no-user-id", null, null, "z", ts, ts + 60_000);
+      insert.run("legacy-sid-4", "zhang-san-renamed", 4242, null, "renamed", ts, ts + 60_000);
+      const oldColumns = "id, login, user_id, avatar_url, access_token_encrypted, created_at, expires_at";
+      const oldSessions = legacy.db.prepare(`SELECT ${oldColumns} FROM sessions ORDER BY id`).all();
       expect(legacy.db.prepare("SELECT COUNT(*) AS n FROM console_seeds WHERE name = ?").get(IDENTITY_SEED)).toEqual({ n: 0 });
       legacy.db.close();
 
@@ -139,7 +150,9 @@ describe("存量回填（老库升级）", () => {
       const db = first.services.storage.db;
       expect(db.prepare("SELECT (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM identities) AS identities").get()).toEqual({ users: 2, identities: 2 });
       const linked = db.prepare("SELECT id, openid, provider FROM sessions ORDER BY id").all() as { id: string; openid: string | null; provider: string | null }[];
-      expect(linked.map(row => [row.id, Boolean(row.openid), row.provider])).toEqual([["legacy-sid-1", true, "github"], ["legacy-sid-2", true, "github"], ["legacy-sid-3", false, null]]);
+      expect(linked.map(row => [row.id, Boolean(row.openid), row.provider])).toEqual([["legacy-sid-1", true, "github"], ["legacy-sid-2", true, "github"], ["legacy-sid-3", false, null], ["legacy-sid-4", true, "github"]]);
+      expect(linked[3].openid).toBe(linked[0].openid);
+      expect(db.prepare(`SELECT ${oldColumns} FROM sessions ORDER BY id`).all()).toEqual(oldSessions);
       // 回填的身份是随机内部 OpenID，且用 GitHub 数字 id 作为 provider_uid
       const identity = first.services.identity.findIdentity(GITHUB_PROVIDER, "4242");
       expect(identity?.user_id).toHaveLength(OPENID_LENGTH);
@@ -160,6 +173,49 @@ describe("存量回填（老库升级）", () => {
 });
 
 describe("登录流程接入内部身份", () => {
+  it.each(["sessions", "audit_logs"])("%s 写入失败时保留旧会话，并撤销本次身份与成功审计", async (table) => {
+    const { app, close } = await testApp({ httpRequest: providerStub(), octokitFactory: membership("active") });
+    try {
+      const db = app.services.storage.db;
+      const oldSid = app.services.auth.createSession("previous-user", 123, "", "previous-token");
+      const oldSession = db.prepare("SELECT * FROM sessions WHERE id = ?").get(oldSid);
+      db.exec(`CREATE TRIGGER fail_login BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'injected login failure'); END`);
+      const { state, cookie } = await startSignIn(app);
+      const response = await app.inject({ url: `/auth/callback?code=ok&state=${state}`, headers: { cookie: `${cookie}; sid=${oldSid}` } });
+      expect(response.statusCode).toBe(500);
+      expect(sidFrom(response)).toBeNull();
+      expect(db.prepare("SELECT * FROM sessions").all()).toEqual([oldSession]);
+      expect(app.services.auth.getSession(oldSid)?.login).toBe("previous-user");
+      expect(db.prepare("SELECT (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM identities) AS identities, (SELECT COUNT(*) FROM identity_audit) AS audit").get())
+        .toEqual({ users: 0, identities: 0, audit: 0 });
+    } finally {
+      await close();
+    }
+  });
+
+  it("重复登录失败不更新 last_login_at，也不留下成功审计", async () => {
+    let now = 1_700_000_000_000;
+    const { app, close } = await testApp({ clock: () => now, httpRequest: providerStub(), octokitFactory: membership("active") });
+    try {
+      const first = await startSignIn(app);
+      const firstResponse = await app.inject({ url: `/auth/callback?code=ok&state=${first.state}`, headers: { cookie: first.cookie } });
+      const oldSid = sidFrom(firstResponse)!;
+      const identity = app.services.identity.findIdentity(GITHUB_PROVIDER, String(githubUser.id));
+      const db = app.services.storage.db;
+      now += 60_000;
+      db.exec("CREATE TRIGGER fail_login BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'injected login failure'); END");
+      const second = await startSignIn(app);
+      const response = await app.inject({ url: `/auth/callback?code=ok&state=${second.state}`, headers: { cookie: `${second.cookie}; sid=${oldSid}` } });
+      expect(response.statusCode).toBe(500);
+      expect(app.services.identity.findIdentity(GITHUB_PROVIDER, String(githubUser.id))).toEqual(identity);
+      expect(app.services.identity.listAudit(identity!.user_id)).toHaveLength(1);
+      expect(app.services.auth.getSession(oldSid)).not.toBeNull();
+      expect(db.prepare("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 1 });
+    } finally {
+      await close();
+    }
+  });
+
   it("登录成功后写入身份并双写会话影子列，旧列语义不变", async () => {
     const { app, close } = await testApp({ httpRequest: providerStub(), octokitFactory: membership("active") });
     const { state, cookie } = await startSignIn(app);
@@ -175,6 +231,17 @@ describe("登录流程接入内部身份", () => {
     expect(app.services.identity.listAudit(identity!.user_id)).toEqual([
       expect.objectContaining({ action: "login", provider: "github", provider_uid: String(githubUser.id), result: "created" }),
     ]);
+    const sid = sidFrom(response)!;
+    const session = app.services.auth.getSession(sid);
+    expect(session).toEqual({
+      id: sid, login: githubUser.login, user_id: githubUser.id, avatar_url: "",
+      accessToken: "provider-token", expires_at: expect.any(Number),
+    });
+    // 影子列只写不读：即使其值与 GitHub 不一致，也不能影响现有会话或公开接口。
+    db.prepare("UPDATE sessions SET openid = 'shadow-only', provider = 'shadow-only' WHERE id = ?").run(sid);
+    expect(app.services.auth.getSession(sid)).toEqual(session);
+    const me = await app.inject({ url: "/auth/me", headers: { cookie: `sid=${sid}` } });
+    expect(me.json()).toEqual({ signed_in: true, login: githubUser.login, user_id: githubUser.id, avatar_url: "", console_link: false });
     await close();
   });
 

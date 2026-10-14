@@ -71,16 +71,21 @@ export default async function authRoutes(app: FastifyInstance) {
       }
       // 内部身份（#226）：第三方凭据（GitHub 数字 id）先落成内部 OpenID，再把它双写进会话的影子列。
       // `/user` 的 email 只是公开邮箱、无法证明已验证，所以按未验证处理（不写 canonical_email）。
-      const identity = identities.resolveGithubIdentity({ login: user.login, userId: user.id, email: user.email, emailVerified: false });
-      identities.audit({
-        action: "login", userId: identity.openid, provider: "github", providerUid: String(user.id),
-        ip: req.ip, ua: req.headers["user-agent"] ?? null, result: identity.created ? "created" : "ok",
-      });
-      // 登录成功后轮换 session id：浏览器上原有的那个会话立即作废，避免会话固定（#226）。
-      const previousSid = req.cookies?.sid;
-      if (previousSid) destroySession(previousSid);
-      const sid = createSession(user.login, user.id, user.avatar_url, token, { openid: identity.openid, provider: "github" });
-      audit(null, user.login, "auth.signin", user.login, undefined, req.ip);
+      // 身份、两种审计与会话轮换一起提交；任何写入失败都保留旧会话，不留下半次成功登录。
+      // GitHub 请求已在事务外完成，提交成功后才向浏览器写新 sid。
+      const sid = app.services.storage.db.transaction(() => {
+        const identity = identities.resolveGithubIdentity({ login: user.login, userId: user.id, email: user.email, emailVerified: false });
+        identities.audit({
+          action: "login", userId: identity.openid, provider: "github", providerUid: String(user.id),
+          ip: req.ip, ua: req.headers["user-agent"] ?? null, result: identity.created ? "created" : "ok",
+        });
+        // 只轮换当前浏览器的会话，不影响其它设备上的登录。
+        const previousSid = req.cookies?.sid;
+        if (previousSid) destroySession(previousSid);
+        const nextSid = createSession(user.login, user.id, user.avatar_url, token, { openid: identity.openid, provider: "github" });
+        audit(null, user.login, "auth.signin", user.login, undefined, req.ip);
+        return nextSid;
+      })();
       reply.setCookie("sid", sid, {
         httpOnly: true, secure: config.cookieSecure, sameSite: "lax", path: "/", maxAge: 7 * 24 * 60 * 60,
         domain: config.cookieDomain,

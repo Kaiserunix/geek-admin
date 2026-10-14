@@ -11,17 +11,17 @@ import { randomBytes } from "node:crypto";
 
 /** Crockford Base32：去掉容易看错的 I、L、O、U。 */
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-/** 时间戳部分占 10 个字符（50 位毫秒）。 */
+/** 时间戳部分占 10 个字符（48 位毫秒，最高两位补零）。 */
 const TIME_LENGTH = 10;
 /** 随机部分占 16 个字符（80 位）。 */
 const RANDOM_LENGTH = 16;
 /** OpenID 的总字符数。 */
 export const OPENID_LENGTH = TIME_LENGTH + RANDOM_LENGTH;
-/** 时间戳能表示的上限（50 位），超过就溢出了。 */
-const MAX_TIMESTAMP = 2 ** 50 - 1;
+/** ULID 时间戳的上限（48 位），超过会使整个标识超出 128 位。 */
+const MAX_TIMESTAMP = 2 ** 48 - 1;
 
 export function newOpenId(now: number = Date.now(), random: (size: number) => Buffer = randomBytes): string {
-  if (!Number.isInteger(now) || now < 0 || now > MAX_TIMESTAMP) throw new Error("openid 时间戳必须是 0 到 2^50-1 之间的整数");
+  if (!Number.isInteger(now) || now < 0 || now > MAX_TIMESTAMP) throw new Error("openid 时间戳必须是 0 到 2^48-1 之间的整数");
   let time = "";
   let rest = now;
   for (let index = 0; index < TIME_LENGTH; index += 1) {

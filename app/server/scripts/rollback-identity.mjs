@@ -10,7 +10,7 @@
 //   2. 删掉 console_seeds 里的 identity_openid 标记；
 //   3. 丢掉 users / identities / identity_audit 三张表。
 // 旧列（login / user_id / access_token_encrypted / created_at / expires_at）自始至终没有被改过，
-// 所以回滚后服务按改造前的逻辑照常跑；下次启动会重新建出三张空表，不影响既有会话。
+// 回滚前先停使用新身份表的服务，回滚后启动改造前版本；再次启动本版本会重新建表并回填。
 // 只碰上面这几样，不动任何其它表，不连网络，也不写库文件之外的任何路径。
 import Database from "better-sqlite3";
 import { existsSync, realpathSync } from "node:fs";
@@ -36,17 +36,20 @@ if (!existsSync(dbPath)) {
   process.exit(2);
 }
 
-const db = new Database(dbPath);
+const db = new Database(dbPath, { readonly: !confirmed, fileMustExist: true });
 const hasTable = (name) => db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 const present = TABLES.filter(hasTable);
 const seeded = hasTable("console_seeds") && db.prepare("SELECT 1 FROM console_seeds WHERE name = ?").get(SEED) !== undefined;
 const sessionColumns = hasTable("sessions") ? db.pragma("table_info(sessions)").map((column) => column.name) : [];
-const shadowed = sessionColumns.includes("openid") ? db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE openid IS NOT NULL").get().n : 0;
+// 升级可能中断在两次 ADD COLUMN 之间；列名只取代码允许列表，不假定两列同时存在。
+const shadowColumns = ["openid", "provider"].filter(column => sessionColumns.includes(column));
+const shadowPredicate = shadowColumns.map(column => `${column} IS NOT NULL`).join(" OR ");
+const shadowed = shadowColumns.length ? db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE ${shadowPredicate}`).get().n : 0;
 
 console.log(`库文件：${realpathSync(dbPath)}`);
 console.log(`存在的身份表：${present.length ? present.join("、") : "（无）"}`);
 console.log(`console_seeds 标记 ${SEED}：${seeded ? "在" : "不在"}`);
-console.log(`已写入 openid 的会话：${shadowed} 行`);
+console.log(`已写入身份影子列的会话：${shadowed} 行`);
 
 if (!present.length && !seeded && !shadowed) {
   console.log("没有可回滚的内容；未做任何改动。");
@@ -60,8 +63,8 @@ if (!confirmed) {
 }
 
 const result = db.transaction(() => {
-  const sessionsCleared = sessionColumns.includes("openid")
-    ? db.prepare("UPDATE sessions SET openid = NULL, provider = NULL WHERE openid IS NOT NULL OR provider IS NOT NULL").run().changes
+  const sessionsCleared = shadowColumns.length
+    ? db.prepare(`UPDATE sessions SET ${shadowColumns.map(column => `${column} = NULL`).join(", ")} WHERE ${shadowPredicate}`).run().changes
     : 0;
   if (hasTable("console_seeds")) db.prepare("DELETE FROM console_seeds WHERE name = ?").run(SEED);
   const dropped = [];
